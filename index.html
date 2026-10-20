@@ -22,14 +22,22 @@
    relativistic effects (precession, swallowing) happen on planetary orbits.
    Change C_LIGHT below to rescale everything relativistic.
  * Body radii are strongly exaggerated (planets ~0.05 AU) so they are visible;
-   collisions use these radii.  An extra "Darstellungsgröße" factor only
-   affects rendering.
+   collisions use these radii. "Darstellungsgröße" only affects rendering.
  * Time scale "1×" = 1 simulated day per real second (real time would make
    nothing move). Range 0.1× … 10,000,000×.
  * "Sprung ×N" = jump forward instantly by N seconds' worth of the current
    speed (e.g. at 100× a "Sprung ×10" advances 1000 days). It is integrated
    with full accuracy, spread over several frames (progress bar, cancelable).
-   There is no reverse.
+   There is no reverse. "Einzelschritt" = 1/60 s of the current speed.
+ * Overload policy: if the requested speed does not fit the CPU budget, the
+   step size is first coarsened (up to ×12, warning "Simulation nicht mehr
+   genau"), then the speed is capped (warning "Tempo begrenzt"). Option
+   "Genauigkeit vor Tempo" skips the coarsening.
+ * Energy drift is measured against the energy after the last discrete
+   event (edit, merger, swallowing); accretion of debris is book-kept.
+   With the 1PN term and >= 3 bodies the 1PN pair energy is not conserved;
+   its exact non-conservative change is integrated along (see PHYSICS), so
+   the readout still measures integration error only.
  * Rendering metric: TRUE KERR geodesics. Null geodesics are integrated as a
    Hamiltonian system in Cartesian Kerr–Schild coordinates (no polar
    coordinate singularity) with RK4 and a step length proportional to the
@@ -37,16 +45,26 @@
    b = 5.19 M (exact 3√3 = 5.196), Kerr a=0.998 shadow edges +6.99 M / −2.11 M.
  * The camera is a STATIC observer (hovering, not orbiting) – a proper local
    tetrad is built, so the view is correct even close to the hole. It can not
-   enter the ergosphere (pushed out automatically).
+   enter the ergosphere (pushed out automatically). It does not inherit the
+   followed body's velocity (no aberration).
+ * Shader coordinates are relative to the primary hole (the metric's natural
+   origin), computed in double precision on the CPU and only then rounded to
+   float32; without a hole they are relative to the camera target.
  * Physics ignores the hole's spin (Newton + optional 1PN-style precession);
-   only the renderer uses the Kerr metric.  Secondary black holes are rendered
-   in the weak-field approximation (see shader comments).
+   only the renderer uses the Kerr metric. Secondary black holes are rendered
+   in the weak-field approximation (see shader comments and UI tooltip).
  * Tidal disruption is applied to STARS only (planet/moon radii are so inflated
-   that their Roche limit would be absurdly large).
- * The camera does not inherit the followed body's velocity (no aberration).
+   that their Roche limit would be absurdly large). The debris is rendered as
+   an emissive 96³ density volume inside the ray march (so it is lensed).
  * Orbit trails in the 3D view are an unlensed overlay (lines drawn on top).
+ * Disk colour mode defaults to "Cinematic"; "Physikalisch" uses the exact
+   blackbody colour at the observed temperature g·T.
  * Up to 40 bodies; the 32 non-black-hole bodies nearest to the camera are
    ray traced, up to 8 additional black holes are rendered approximately.
+ * When the side panel is open the 3D view centre is shifted (lens shift) so
+   that the camera target is centred in the visible area.
+ * Test hook: index.html#noloop does not start requestAnimationFrame; frames
+   can then be driven via window.__app.tick(timeMs).
 ================================================================================
 -->
 <style>
@@ -306,6 +324,8 @@ uniform vec3  uCamPos;         // camera position (BH-local, units of GM/c²)
 uniform vec4  uE0, uE1, uE2, uE3;      // camera tetrad, contravariant (t,x,y,z): e0 = 4-velocity, e1 right, e2 up, e3 forward
 uniform vec4  uE0L, uE1L, uE2L, uE3L;  // the same tetrad with index lowered by the metric at the camera
 uniform mat3  uLocalToWorld;   // rotates BH-local directions to world directions (the sky is fixed in world space)
+uniform int   uLdrOut;         // 1 = no float render targets: tone map + gamma here (8-bit fallback)
+uniform float uExposureT;      // exposure (only used for the 8-bit fallback)
 
 // ---------------- primary black hole (Kerr) ----------------
 uniform int   uHasBH;          // 0: no black hole -> straight rays
@@ -443,8 +463,7 @@ vec3 sky(vec3 d, float fp) {
 #define SEC_CAPTURE 2.0
 vec3 secondaryDp(vec3 x, float pt) {
   vec3 acc = vec3(0.0);
-  for (int j = 0; j < MAX_SEC_BH; ++j) {
-    if (j >= uNumSecBH) break;
+  for (int j = 0; j < uNumSecBH; ++j) {
     vec3 d = x - uSecBH[j].xyz;
     float rho2 = max(dot(d, d), 1e-6);
     acc += 2.0 * uSecBH[j].w * pt * pt * d / (rho2 * sqrt(rho2));
@@ -585,20 +604,24 @@ vec4 diskSample(vec3 xc, vec3 p, float pt) {
 //  the BENT ray, so bodies near the hole appear distorted, doubled and as
 //  Einstein rings automatically.
 // =====================================================================
-// First hit of the segment o + t*dn, t in [0, len], with any body. Returns index or -1.
+// First hit of the segment o + t*dn (|dn| = 1), t in [0, len], with any body. Returns index or -1.
+// Numerically robust form (Haines et al., Ray Tracing Gems ch. 7): the squared miss distance is
+// computed from the perpendicular vector instead of dot(oc,oc) − R², which would cancel
+// catastrophically in float32 when the segment starts far away from a small sphere.
 int hitBodies(vec3 o, vec3 dn, float len, out float tHit) {
   tHit = 1e30;
   int idx = -1;
-  for (int j = 0; j < MAX_BODIES; ++j) {
-    if (j >= uNumBodies) break;
+  for (int j = 0; j < uNumBodies; ++j) {
     vec4 b = uBodyPosR[j];
     vec3 oc = o - b.xyz;
     float B = dot(oc, dn);
-    float C = dot(oc, oc) - b.w * b.w;
-    if (B > b.w && C > 0.0) continue;                // moving away from it and outside
-    float disc = B * B - C;
+    float R2 = b.w * b.w;
+    bool inside = dot(oc, oc) < R2;
+    if (B > b.w && !inside) continue;                // moving away from it and outside
+    vec3 perp = oc - B * dn;                         // closest-approach vector
+    float disc = R2 - dot(perp, perp);
     if (disc < 0.0) continue;
-    float t = C < 0.0 ? 0.0 : -B - sqrt(disc);       // C < 0: segment starts inside the sphere
+    float t = inside ? 0.0 : -B - sqrt(disc);        // inside: segment starts within the sphere
     if (t >= 0.0 && t <= len && t < tHit) { tHit = t; idx = j; }
   }
   return idx;
@@ -710,8 +733,9 @@ void debrisSegment(vec3 a, vec3 b, float segL, inout vec3 col, inout float trans
 void traceKerr(inout vec3 x, vec4 P, inout vec3 col, inout float trans, inout vec3 dir, inout int status) {
   vec3 p = P.yzw;
   float pt = P.x;
-  for (int i = 0; i < HARD_MAX_STEPS; ++i) {
-    if (i >= uMaxSteps) break;
+  // Loop bounds are uniforms (allowed in GLSL ES 3.00): keeps D3D/ANGLE from trying to unroll.
+  int nSteps = min(uMaxSteps, HARD_MAX_STEPS);
+  for (int i = 0; i < nSteps; ++i) {
     vec3 k1x, k1p, k2x, k2p, k3x, k3p, k4x, k4p;
     float r = kerrDeriv(x, p, pt, k1x, k1p);
     if (r < uRHor * 1.02) { status = ST_CAPT; return; }       // fell into the horizon
@@ -720,8 +744,7 @@ void traceKerr(inout vec3 x, vec4 P, inout vec3 col, inout float trans, inout ve
     if (r > uREsc && dot(x, k1x) > 0.0) { status = ST_ESC; return; }
     // ---- adaptive step: proportional to r (fine near photon sphere, coarse far away)
     float ds = max(uStepK * r, 0.01);
-    for (int j = 0; j < MAX_SEC_BH; ++j) {        // refine steps near secondary holes, absorb rays
-      if (j >= uNumSecBH) break;
+    for (int j = 0; j < uNumSecBH; ++j) {         // refine steps near secondary holes, absorb rays
       float rho = length(x - uSecBH[j].xyz);
       if (rho < SEC_CAPTURE * uSecBH[j].w) { status = ST_CAPT; return; }
       ds = min(ds, max(uStepK * 1.5 * rho, 0.02 * uSecBH[j].w));
@@ -794,6 +817,10 @@ void main() {
   float fp = max(length(dFdx(dw)), length(dFdy(dw)));
   fp = clamp(max(fp, uPixelAngle * 0.5), 0.0, 0.05);
   if (status == ST_ESC && trans > 0.0) col += trans * sky(normalize(dw), fp);
+  if (uLdrOut == 1) {   // 8-bit fallback: ACES tone mapping + gamma before storing
+    vec3 x = col * uExposureT;
+    col = pow(clamp(x * (2.51 * x + 0.03) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0), vec3(1.0 / 2.2));
+  }
   outColor = vec4(col, 1.0);
 }`;
 
@@ -1042,7 +1069,11 @@ const Kerr = {
    u'' + u = GM/h² + 3GM u²/c² exactly, i.e. the perihelion advance
    Δφ = 6πGM / (c² a (1−e²)) per orbit, the innermost stable orbit at 6GM/c²
    and plunging orbits. The matching conserved energy contains the extra pair
-   term −G m_i m_j h² / (c² r³), which is included in the drift readout.
+   term U_ij = −G m_i m_j h² / (c² r³), which is included in the drift readout.
+   With three or more bodies other bodies torque a pair (h changes), so
+   E_N + ΣU is not conserved; its exact rate of change is
+   Σ ∂U/∂(h²)·d(h²)/dt = −Σ G m_i m_j/(c² r³)·d(h²)/dt. This integral is
+   accumulated every step (pnWork) so the readout measures integration error only.
    ============================================================================= */
 const MAX_BODIES = 40;
 const SOFT2 = 1e-14;                 // softening² in AU² – only a safety net against r = 0
@@ -1056,7 +1087,7 @@ function makeBody(o) {
     id: nextBodyId++,
     name: o.name || TYPE_NAMES[o.type || 'planet'],
     type: o.type || 'planet',
-    m: o.m ?? 3e-6,
+    m: o.m ?? 3.003e-6,
     R: o.R ?? (o.type === 'bh' ? 0 : 0.05),
     color: o.color || '#8fb4ff',
     pos: (o.pos || [0, 0, 0]).slice(),
@@ -1065,6 +1096,7 @@ function makeBody(o) {
     tilt: o.tilt ?? 0,              // black holes: tilt of the spin axis / disk (rad, about world x)
     tiltAz: o.tiltAz ?? 0,          // black holes: azimuth of that tilt (rad, about world z)
     look: o.look ?? Math.random(),  // seed for the procedural surface
+    hideTrail: !!o.hideTrail,       // per-body trail toggle
     trail: null,
   };
 }
@@ -1141,6 +1173,10 @@ class Sim {
     for (const k of ['x', 'y', 'z', 'vx', 'vy', 'vz', 'ax', 'ay', 'az', 'm', 'R', 'rs', 'trailThr'])
       this[k] = new Float64Array(n);
     this.isBH = new Uint8Array(n); this.isStar = new Uint8Array(n);
+    this.h2prev = new Float64Array(n * n);   // h² of PN pairs at the previous step
+    this.ir3prev = new Float64Array(n * n);  // 1/r³ of PN pairs at the previous step
+    this.pnPrevOk = false;
+    this.pnWork = 0;                         // accumulated non-conservative 1PN energy change
     this.n = 0;
     this.hits = [];
     this.steps = 0;
@@ -1159,6 +1195,7 @@ class Sim {
       if (!b.trail || b.trail.cap !== this.trailLen) b.trail = new Trail(this.trailLen);
     }
     this.updateTrailThresholds();
+    this.pnPrevOk = false;
     this.computeAcc();
   }
   unpack() {
@@ -1172,7 +1209,7 @@ class Sim {
   /* Call after ANY external edit of bodies (add, delete, change mass/pos/vel). */
   reset(keepEnergyRef = false) {
     this.pack();
-    if (!keepEnergyRef) this.E0 = this.energy();
+    if (!keepEnergyRef) { this.pnWork = 0; this.E0 = this.energy(); }
   }
 
   /* ---- accelerations, adaptive time scale and contact detection, O(N²) */
@@ -1194,7 +1231,12 @@ class Sim {
         const anyBH = bh[i] | bh[j];
         if (pn && anyBH) {
           const hx = dy * dvz - dz * dvy, hy = dz * dvx - dx * dvz, hz = dx * dvy - dy * dvx;
-          s *= 1 + 3 * (hx * hx + hy * hy + hz * hz) / (c2 * r2);
+          const h2 = hx * hx + hy * hy + hz * hz;
+          s *= 1 + 3 * h2 / (c2 * r2);
+          // non-conservative part of the 1PN energy (trapezoidal rule in time)
+          const q = i * MAX_BODIES + j, ir3 = 1 / (r2 * r);
+          if (this.pnPrevOk) this.pnWork -= mi * m[j] / c2 * 0.5 * (ir3 + this.ir3prev[q]) * (h2 - this.h2prev[q]);
+          this.h2prev[q] = h2; this.ir3prev[q] = ir3;
         }
         const mj = m[j];
         ax[i] += mj * s * dx; ay[i] += mj * s * dy; az[i] += mj * s * dz;
@@ -1221,6 +1263,7 @@ class Sim {
     }
     this.dtNext = this.eta * Math.sqrt(tau2);
     if (!isFinite(this.dtNext) || this.dtNext <= 0) this.dtNext = 1e-2;
+    this.pnPrevOk = pn;
   }
 
   /* ---- one KDK leapfrog step */
@@ -1285,10 +1328,10 @@ class Sim {
     return { done, steps, frac: dtReq > 0 ? done / dtReq : 1, ms: used };
   }
 
-  /* ---- total energy (Newton + 1PN pair term), O(N²) */
+  /* ---- total energy (Newton + 1PN pair term − accumulated non-conservative 1PN part), O(N²) */
   energy() {
     const n = this.n, c2 = C_LIGHT * C_LIGHT;
-    let E = 0;
+    let E = this.pn ? -this.pnWork : 0;
     for (let i = 0; i < n; i++) E += 0.5 * this.m[i] * (this.vx[i] ** 2 + this.vy[i] ** 2 + this.vz[i] ** 2);
     for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
       const dx = this.x[j] - this.x[i], dy = this.y[j] - this.y[i], dz = this.z[j] - this.z[i];
@@ -1563,6 +1606,13 @@ class Renderer {
   updateDebris(fd) {
     const D = sim.debris, bh = primaryBH();
     if (!bh || !D.n) return false;
+    const key = sim.t + ':' + bh.id + ':' + bh.tilt + ':' + bh.tiltAz + ':' + D.n;
+    if (key === this.debKey) return this.debOk;
+    this.debKey = key;
+    this.debOk = this.splatDebris(fd, D, bh);
+    return this.debOk;
+  }
+  splatDebris(fd, D, bh) {
     const N = this.DEB_N, grid = this.debGrid;
     const R = fd.Rlw, L = fd.L, o = bh.pos;
     const loc = new Float32Array(D.n * 3);
@@ -1622,6 +1672,8 @@ class Renderer {
     gl.uniform2f(u.uRes, rw, rh);
     gl.uniform2f(u.uJitter, jitter[0], jitter[1]);
     gl.uniform1f(u.uNdcShift, viewShift());
+    gl.uniform1i(u.uLdrOut, this.hdr ? 0 : 1);
+    gl.uniform1f(u.uExposureT, Math.pow(2, settings.exposure));
     const tanH = Math.tan(settings.fov * Math.PI / 360);
     gl.uniform1f(u.uTanHalfFov, tanH);
     gl.uniform1f(u.uAspect, rw / rh);
@@ -1648,7 +1700,7 @@ class Renderer {
     gl.uniform1f(u.uDoppler, dk.doppler); gl.uniform1f(u.uDiskTurb, dk.turb);
     gl.uniform1f(u.uDiskTime, fd.diskTime); gl.uniform1f(u.uDiskSpinVis, dk.spinVis);
     gl.uniform1f(u.uDiskGlow, fd.diskGlow || 0);
-    gl.uniform1i(u.uNumBodies, fd.nb);
+    gl.uniform1i(u.uNumBodies, Math.min(fd.nb, 32));
     if (fd.nb) {
       gl.uniform4fv(u.uBodyPosR, fd.bPosR); gl.uniform4fv(u.uBodyCol, fd.bCol);
       gl.uniform4fv(u.uBodyVel, fd.bVel); gl.uniform4fv(u.uBodyLight, fd.bLight);
@@ -1658,7 +1710,7 @@ class Renderer {
     gl.uniform1f(u.uDebrisHalf, this.debHalf);
     gl.uniform1f(u.uDebrisBright, settings.debrisBright * 0.2);
     gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_3D, this.debTex); gl.uniform1i(u.uDebrisTex, 1);
-    gl.uniform1i(u.uNumSecBH, fd.nSec);
+    gl.uniform1i(u.uNumSecBH, Math.min(fd.nSec, 8));
     if (fd.nSec) gl.uniform4fv(u.uSecBH, fd.secArr);
     gl.uniform3fv(u.uWorldUpL, fd.worldUpL);
     gl.uniform3fv(u.uDiskLightCol, fd.diskLightCol);
@@ -1792,6 +1844,8 @@ const settings = {
           opacity: 0.92, doppler: 2.5, turb: 0.6, spinVis: 0.45 },
 };
 settings.disk.mode = 'cinematic';
+// HiDPI screens already have ~4x the pixels: start lower there (auto-quality adapts further)
+settings.resScale = settings.userResScale = (window.devicePixelRatio || 1) > 1.25 ? 0.6 : 1.0;
 const sim = new Sim();
 const camera = new OrbitCamera();
 let selectedId = null;
@@ -1853,16 +1907,15 @@ function buildFrameData(time) {
   const nb = rb.length;
   const bPosR = new Float32Array(128), bCol = new Float32Array(128), bVel = new Float32Array(128), bLight = new Float32Array(128);
   const lumOf = o => Math.min(1e5, Math.pow(Math.max(o.m, 0.08), 3.5));     // main-sequence L ∝ M^3.5 (L☉)
-  let maxR = 0;
   for (let i = 0; i < nb; i++) {
     const o = rb[i];
     const pl = toLocal(V.mul(V.sub(o.pos, origin), 1 / L));
     const rr = o.R * settings.bodyScale / L;
     bPosR.set([pl[0], pl[1], pl[2], rr], i * 4);
-    maxR = Math.max(maxR, V.len(pl) + rr);
     const c = hexToRgb(o.color).map(v => Math.pow(v, 2.2));
     bCol.set([c[0], c[1], c[2], bodyKind(o) + 0.9 * (o.look % 1)], i * 4);
-    const vl = toLocal(V.mul(o.vel, 1 / C_LIGHT));
+    // velocity relative to the hole's rest frame (the frame of the static camera), in units of c
+    const vl = toLocal(V.mul(hasBH ? V.sub(o.vel, bh.vel) : o.vel, 1 / C_LIGHT));
     const spinVis = o.type === 'star' ? 0.04 : bodyKind(o) === 2 ? 0.5 : 0.25;
     bVel.set([vl[0], vl[1], vl[2], spinVis * (0.7 + 0.6 * ((o.look * 7.3) % 1))], i * 4);
     // illumination: brightest star by flux L/d², compressed (flux^0.25) so outer planets stay visible
@@ -1878,12 +1931,13 @@ function buildFrameData(time) {
   // ---- secondary black holes (weak-field)
   const sec = sim.bodies.filter(o => o.type === 'bh' && o !== bh).sort((p, q) => q.m - p.m).slice(0, 8);
   const secArr = new Float32Array(32);
-  sec.forEach((o, i) => { const pl = toLocal(V.mul(V.sub(o.pos, origin), 1 / L)); secArr.set([pl[0], pl[1], pl[2], o.m / bh.m], i * 4); maxR = Math.max(maxR, V.len(pl)); });
+  sec.forEach((o, i) => { const pl = toLocal(V.mul(V.sub(o.pos, origin), 1 / L)); secArr.set([pl[0], pl[1], pl[2], o.m / bh.m], i * 4); });
   return {
     time, hasBH, spin, L, camPos: camL, tet, camWorld, basis: b, origin, Rlw,
     disk: { ...dk, on: dk.on && hasBH, rIn, rOut: Math.max(dk.outer, rIn * 1.2) },
     diskTime: visClock, diskGlow: sim.diskGlow,
-    localToWorld: Rlw, rEsc: Math.max(1000, 2.5 * camDist, 1.2 * maxR),
+    // escape radius: beyond it rays are straight (bodies further out are caught by the final straight test)
+    localToWorld: Rlw, rEsc: Math.max(1000, 2.5 * camDist),
     nb, bPosR, bCol, bVel, bLight, nSec: sec.length, secArr,
     worldUpL: toLocal([0, 0, 1]),
     diskLightCol: dk.mode === 'cinematic' ? [1.0, 0.62, 0.3] : blackbodyRGB(dk.temp).slice(0, 3).map((v, i, a) => v / Math.max(...a)),
@@ -1891,18 +1945,20 @@ function buildFrameData(time) {
   };
 }
 
-/* Orbit trails (and debris points) as overlay geometry, camera-relative. */
+let overlayBuf = null;
+/* Orbit trails as overlay geometry, camera-relative (double precision subtraction, then float32). */
 function buildOverlay(fd) {
   const strips = [];
   let total = 0;
-  if (settings.trails3D) for (const b of sim.bodies) if (b.trail) total += b.trail.n;
-  const dn = sim.debris.n;
-  const data = new Float32Array((total + dn) * 7);
+  if (settings.trails3D) for (const b of sim.bodies) if (b.trail && !b.hideTrail) total += b.trail.n;
+  const need = total * 7;
+  if (!overlayBuf || overlayBuf.length < need) overlayBuf = new Float32Array(Math.max(need, 4096) * 1.5 | 0);
+  const data = overlayBuf;
   let o = 0, v = 0;
   const cx = fd.camWorld[0], cy = fd.camWorld[1], cz = fd.camWorld[2];
   if (settings.trails3D) for (const b of sim.bodies) {
     const tr = b.trail;
-    if (!tr || tr.n < 2) continue;
+    if (!tr || tr.n < 2 || b.hideTrail) continue;
     const c = b.type === 'bh' ? [1.0, 0.62, 0.23] : hexToRgb(b.color);
     const first = v;
     for (let k = 0; k < tr.n; k++) {
@@ -1950,10 +2006,10 @@ function solarSystem(withMoon) {
   const B = [sun,
     orbiting(sun, { name: 'Merkur', type: 'planet', m: 1.66e-7, R: 0.022, color: '#a99d90', look: 0.11 }, 0.39, 0.12, 4, 48, 29, 0),
     orbiting(sun, { name: 'Venus', type: 'planet', m: 2.45e-6, R: 0.034, color: '#e6c98f', style: 'gas', look: 0.27 }, 0.72, 0.01, 2.4, 76, 55, 120),
-    orbiting(sun, { name: 'Erde', type: 'planet', m: 3.0e-6, R: 0.036, color: '#4f86d9', style: 'rocky', look: 0.52 }, 1.0, 0.017, 0, 0, 100, 250),
+    orbiting(sun, { name: 'Erde', type: 'planet', m: 3.003e-6, R: 0.036, color: '#4f86d9', style: 'rocky', look: 0.52 }, 1.0, 0.017, 0, 0, 100, 250),
     orbiting(sun, { name: 'Mars', type: 'planet', m: 3.2e-7, R: 0.027, color: '#c8643c', style: 'rocky', look: 0.73 }, 1.52, 0.09, 1.8, 49, 286, 60),
   ];
-  const jup = orbiting(sun, { name: 'Jupiter', type: 'planet', m: 9.5e-4, R: 0.05, color: '#d8a86e', look: 0.35 }, 4.0, 0.048, 1.3, 100, 14, 170);
+  const jup = orbiting(sun, { name: 'Jupiter', type: 'planet', m: 9.546e-4, R: 0.05, color: '#d8a86e', look: 0.35 }, 4.0, 0.048, 1.3, 100, 14, 170);
   B.push(jup);
   // moon at ~0.36 Hill radii of Jupiter (prograde moons are stable up to ~0.5)
   if (withMoon) B.push(orbiting(jup, { name: 'Ganymed', type: 'moon', m: 7.5e-8, R: 0.012, color: '#b9b2a6', look: 0.64 }, 0.1, 0.0, 2, 0, 0, 30));
@@ -1969,7 +2025,7 @@ const PRESETS = [
   { id: 'precession', name: '2 · Planet auf exzentrischer Bahn um ein Schwarzes Loch',
     build() {
       const bh = makeBody({ name: 'Schwarzes Loch', type: 'bh', m: 10, spin: 0.9 });
-      const pl = orbiting(bh, { name: 'Wanderer', type: 'planet', m: 3e-6, R: 0.11, color: '#5f9bff', style: 'rocky', look: 0.42 }, 4.0, 0.55, 14, 0, 0, 180);
+      const pl = orbiting(bh, { name: 'Wanderer', type: 'planet', m: 3.003e-6, R: 0.11, color: '#5f9bff', style: 'rocky', look: 0.42 }, 4.0, 0.55, 14, 0, 0, 180);
       const B = [bh, pl]; zeroMomentum(B, false);
       return { bodies: B, timeScale: 300, pn: true, select: 'Wanderer', camera: { follow: 'bh', az: -1.25, el: 0.38, dist: 7.5 },
                disk: { outer: 20 } };
@@ -2039,7 +2095,7 @@ function resetSceneState() {
 }
 
 /* ---- JSON (de)serialisation ---- */
-const BODY_KEYS = ['name', 'type', 'style', 'm', 'R', 'color', 'pos', 'vel', 'spin', 'tilt', 'tiltAz', 'look'];
+const BODY_KEYS = ['name', 'type', 'style', 'm', 'R', 'color', 'pos', 'vel', 'spin', 'tilt', 'tiltAz', 'look', 'hideTrail'];
 function serializeScene() {
   return {
     format: 'gravitations-sandkasten', version: 1, savedAt: new Date().toISOString(),
@@ -2067,6 +2123,7 @@ function loadSceneData(d) {
       color: /^#[0-9a-f]{6}$/i.test(b.color || '') ? b.color : '#8fb4ff',
       pos: vec(b.pos), vel: vec(b.vel), spin: Math.min(0.998, Math.max(0, num(b.spin, 0.8))),
       tilt: num(b.tilt, 0), tiltAz: num(b.tiltAz, 0), look: num(b.look, Math.random()),
+      hideTrail: b.hideTrail === true,
     });
   });
   resetSceneState();
@@ -2125,7 +2182,7 @@ function defaultBody(type) {
     case 'star': return { name: `Stern ${n}`, type, m: 1, R: 0.12, color: '#fff3dc' };
     case 'moon': return { name: `Mond ${n}`, type, m: 3.7e-8, R: 0.014, color: '#bdb8b0' };
     case 'bh': return { name: `Schwarzes Loch ${n}`, type, m: 10, R: 0, color: '#000000', spin: 0.8 };
-    default: return { name: `Planet ${n}`, type: 'planet', m: 3e-6, R: 0.04, color: PLANET_COLORS[n % PLANET_COLORS.length] };
+    default: return { name: `Planet ${n}`, type: 'planet', m: 3.003e-6, R: 0.04, color: PLANET_COLORS[n % PLANET_COLORS.length] };
   }
 }
 /* strongest attractor of a point (or body) */
@@ -2329,7 +2386,7 @@ function buildPanel() {
     const d = Math.abs(energyDrift);
     const c = d < 1e-6 ? '#7fe08a' : d < 1e-3 ? '#ffd27a' : '#ff7070';
     return `<span style="color:${c}">${energyDrift === 0 ? '0' : energyDrift.toExponential(2)}</span>`;
-  }, 'Relative Abweichung der Gesamtenergie seit dem letzten Eingriff (Hinzufügen, Verschmelzen, …). Klein = genau. Hinweis: mit 1PN-Korrektur und ≥ 3 Körpern gibt es keine exakt erhaltene Energie – eine Drift um 1e-3 ist dann Physik, kein Rechenfehler.'));
+  }, 'Relative Abweichung der Gesamtenergie seit dem letzten Eingriff (Hinzufügen, Verschmelzen, …). Klein = genau. Mit 1PN-Korrektur wird der nicht-konservative Anteil der 1PN-Paarenergie mitintegriert, sodass auch dann nur Rechenfehler angezeigt werden.'));
   const w = h('div', { class: 'warn' });
   ui.refreshers.push(() => { w.innerHTML = simWarnings().join('<br>'); });
   T.append(w);
@@ -2355,7 +2412,8 @@ function buildPanel() {
   const K = h('details', { open: true }, h('summary', {}, 'Körper'));
   K.append(h('div', { class: 'row' }, h('span', { style: 'color:var(--dim)' }, 'Hinzufügen:'),
     ...[['star', 'Stern'], ['planet', 'Planet'], ['moon', 'Mond'], ['bh', 'Schw. Loch']].map(([t, n]) =>
-      h('button', { onclick: () => { const b = addBody(t); if (b) selectBody(b); }, title: `${n} hinzufügen – auf Kreisbahn um die Auswahl (bzw. den schwersten Körper)` }, n))));
+      h('button', { onclick: () => { const b = addBody(t); if (b) selectBody(b); }, title: `${n} hinzufügen – auf Kreisbahn um die Auswahl (bzw. den schwersten Körper)` +
+        (t === 'bh' ? '. Nur das schwerste Schwarze Loch wird exakt (Kerr) gerendert; weitere werden mit schwacher Lichtablenkung 4GM/(c²b) + Schattenscheibe genähert.' : '') }, n))));
   ui.list = h('div', { id: 'bodyList' });
   K.append(ui.list);
   ui.props = h('div', { id: 'props' });
@@ -2422,7 +2480,8 @@ function buildPanel() {
   D.append(slider({ label: 'Struktur / Turbulenz', min: 0, max: 1, step: 0.01, get: () => dk.turb, set: v => dk.turb = v, fmt: v => v.toFixed(2) }));
   D.append(slider({ label: 'Beaming-Exponent (Cinematic)', min: 0, max: 4, step: 0.05, get: () => dk.doppler, set: v => dk.doppler = v, fmt: v => v.toFixed(2), tip: 'Helligkeit ∝ g^n im Cinematic-Modus (physikalisch wäre ~3–4)' }));
   D.append(slider({ label: 'Rotationsanimation', min: 0, max: 2, step: 0.01, get: () => dk.spinVis, set: v => dk.spinVis = v, fmt: v => v.toFixed(2) + ' rad/s', tip: 'Nur visuell: Winkelgeschwindigkeit der Textur am Innenrand' }));
-  D.append(h('div', { class: 'hint' }, 'Weitere Schwarze Löcher werden genähert dargestellt: schwache Lichtablenkung α ≈ 4GM/(c²b) plus schwarze Schattenscheibe. Nur das schwerste Loch wird exakt (Kerr) gerechnet.'));
+  const approxTip = 'Näherung für zusätzliche Schwarze Löcher: Lichtablenkung im schwachen Feld (linearisierte Schwarzschild-Metrik, Gesamtablenkung α ≈ 4GM/(c²b)) plus schwarze Schattenscheibe (Einfang bei ρ < 2GM/c², scheinbarer Schattenradius ≈ 5,4 GM/c² statt exakt 5,2). Kein Spin, keine Scheibe, nahe am Loch ungenau. Nur das schwerste Loch wird exakt (Kerr) gerechnet.';
+  D.append(h('div', { class: 'hint', title: approxTip }, 'ⓘ Weitere Schwarze Löcher werden genähert dargestellt: schwache Lichtablenkung α ≈ 4GM/(c²b) plus schwarze Schattenscheibe. Nur das schwerste Loch wird exakt (Kerr) gerechnet. (Tooltip für Details)'));
   P.append(D);
 
   /* ------------------------------ PHYSIK ------------------------------ */
@@ -2488,8 +2547,7 @@ function simWarnings() {
   const w = [];
   if (sim.relax > 1.05) w.push(`⚠ Simulation nicht mehr genau – Schritte ×${sim.relax.toFixed(1)} vergröbert`);
   if (physInfo.frac < 0.98 && !settings.paused) w.push(`⚠ Tempo begrenzt: effektiv ×${fmtNum(settings.timeScale * physInfo.frac, 3)}`);
-  if (Math.abs(energyDrift) > 1e-2) w.push('⚠ Große Energiedrift – Genauigkeit erhöhen oder langsamer laufen');
-  else if (sim.pn && sim.n >= 3 && Math.abs(energyDrift) > 1e-4) w.push('<span style="color:var(--dim);font-weight:400">Hinweis: 1PN mit ≥3 Körpern – Energie nur näherungsweise erhalten</span>');
+  if (Math.abs(energyDrift) > 1e-2) w.push('⚠ Große Energiedrift – Genauigkeit η verkleinern oder langsamer laufen');
   if (sim.bodies.filter(b => b.type !== 'bh').length > 32) w.push('Nur die 32 nächsten Körper werden im 3D-Bild gerendert');
   return w;
 }
@@ -2587,6 +2645,7 @@ function buildProps(b) {
     h('div', { class: 'grid3' }, h('span', {}, ''), ...[0, 1, 2].map(k => numInput(() => b[arr][k], v => { b[arr][k] = v; if (b.trail) b.trail.clear(); changed(); }, scale, 5))));
   P.append(g3('Position x, y, z', 'pos', 1, 'AE'));
   P.append(g3('Geschwindigkeit vx, vy, vz', 'vel', 1 / KMS, 'km/s'));
+  P.append(check({ label: 'Bahnspur anzeigen', get: () => !b.hideTrail, set: v => { b.hideTrail = !v; } }));
   P.append(kv('|v|', () => fmtNum(V.len(b.vel) / KMS, 4) + ' km/s = ' + fmtNum(V.len(b.vel) / C_LIGHT, 3) + ' c'));
   P.append(h('div', { class: 'row' },
     h('button', { onclick: () => { camera.follow = 'sel'; toast('Kamera folgt ' + b.name); } }, '🎥 Folgen'),
@@ -2758,7 +2817,7 @@ class TopDown {
     return V.add(base, [dxs / 80 * vc, -dys / 80 * vc, 0]);
   }
   onDown(e) {
-    this.cv.setPointerCapture(e.pointerId);
+    capturePointer(this.cv, e.pointerId);
     this.dim = this.size();
     const sx = e.offsetX, sy = e.offsetY;
     const [wx, wy] = this.toWorld(sx, sy);
@@ -2849,7 +2908,7 @@ class TopDown {
     // trails
     for (const b of sim.bodies) {
       const tr = b.trail;
-      if (!tr || tr.n < 2) continue;
+      if (!tr || tr.n < 2 || b.hideTrail) continue;
       ctx.strokeStyle = b.type === 'bh' ? '#ff9d3a' : b.color;
       ctx.lineWidth = 1.2;
       const G8 = 8, per = Math.ceil(tr.n / G8);
@@ -2974,7 +3033,7 @@ class TopDown {
     const B = sim.bodies;
     const viewW = w / this.scale;
     let mMax = 0; for (const b of B) mMax = Math.max(mMax, b.m);
-    const beta = mMax > 0 ? 0.045 * viewW / mMax : 0;
+    const beta = mMax > 0 ? 0.08 * viewW / mMax : 0;
     const soft = 0.035 * viewW;
     const N = 34, S = 48;
     const [x0, y1] = this.toWorld(-w * 0.1, -H * 0.1), [x1, y0] = this.toWorld(w * 1.1, H * 1.1);
@@ -3043,8 +3102,9 @@ function drawLabels(fd) {
 }
 const pointers = new Map();
 let drag3 = null;
+function capturePointer(el, id) { try { el.setPointerCapture(id); } catch (err) { /* pointer already gone – ignore */ } }
 canvas.addEventListener('pointerdown', e => {
-  canvas.setPointerCapture(e.pointerId);
+  capturePointer(canvas, e.pointerId);
   pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
   if (pointers.size === 2) { const [a, b] = [...pointers.values()]; drag3 = { pinch: Math.hypot(a.x - b.x, a.y - b.y) }; return; }
   drag3 = { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, pan: e.button === 2 || e.button === 1 || e.shiftKey, moved: false };
@@ -3106,10 +3166,14 @@ window.addEventListener('keydown', e => {
     case 'm': case 'M': $('mapBox').classList.toggle('hidden'); break;
     case 'Escape': topDown.mode = 'select'; topDown.ghost = null; topDown.drag = null; topDown.pred = null; break;
     case 'Delete': if (selected()) deleteBody(selected()); break;
-    case 'f': case 'F':
-      if (!document.fullscreenElement) document.documentElement.requestFullscreen?.().catch(() => {});
-      else document.exitFullscreen?.();
+    case 'f': case 'F': {
+      const de = document.documentElement;
+      if (!(document.fullscreenElement || document.webkitFullscreenElement)) {
+        const req = de.requestFullscreen || de.webkitRequestFullscreen;
+        if (req) Promise.resolve(req.call(de)).catch(() => {});
+      } else (document.exitFullscreen || document.webkitExitFullscreen).call(document);
       break;
+    }
     default: return;
   }
   e.preventDefault();
@@ -3118,8 +3182,21 @@ window.addEventListener('keydown', e => {
 /* =============================================================================
    14. MAIN LOOP
    ============================================================================= */
-let renderer;
+let renderer, contextLost = false;
 try { renderer = new Renderer(canvas); } catch (err) { console.error(err); }
+// GPU reset (e.g. driver timeout with extreme quality settings): keep simulating, rebuild the renderer when possible
+canvas.addEventListener('webglcontextlost', e => {
+  e.preventDefault(); contextLost = true;
+  toast('WebGL-Kontext verloren (GPU überlastet?) – warte auf Wiederherstellung …', true);
+});
+canvas.addEventListener('webglcontextrestored', () => {
+  try {
+    renderer = new Renderer(canvas); contextLost = false;
+    settings.resScale = settings.userResScale = Math.max(0.25, settings.resScale * 0.6);
+    settings.maxSteps = Math.min(settings.maxSteps, 600);
+    toast('Grafik wiederhergestellt – Qualität reduziert');
+  } catch (err) { console.error(err); }
+});
 const hud = document.getElementById('hud');
 let lastT = performance.now(), fpsAcc = 0, fpsN = 0, fps = 0, msFrame = 0;
 const t0 = performance.now();
@@ -3155,8 +3232,12 @@ function updateCameraFollow() {
   let tgt = null;
   if (camera.follow === 'bh') tgt = primaryBH();
   else if (camera.follow === 'sel') tgt = selected();
-  if (tgt) camera.target = tgt.pos.slice();
-  else if (camera.follow !== 'free') camera.follow = 'free';
+  if (tgt) {
+    camera.target = tgt.pos.slice();
+    // never zoom into the followed body (or into the hole's ergosphere)
+    const minD = tgt.type === 'bh' ? 4 * G * tgt.m / C_LIGHT ** 2 : 1.6 * tgt.R * settings.bodyScale;
+    if (camera.dist < minD) camera.dist = minD;
+  } else if (camera.follow !== 'free') camera.follow = 'free';
 }
 
 function tick(now) {
@@ -3173,7 +3254,7 @@ function tick(now) {
     if (jump.remaining <= jump.total * 1e-12 || sim.n === 0) { jump.active = false; jump.remaining = 0; }
   } else if (!settings.paused && sim.n > 0) {
     physInfo = sim.advance(settings.timeScale * DAY * dtReal, settings.physBudget, !settings.accuracyFirst);
-  } else physInfo = { frac: 1, steps: 0, ms: 0 };
+  } else { physInfo = { frac: 1, steps: 0, ms: 0 }; sim.relax = 1; }
   simMovedThisFrame = simMovedThisFrame || sim.t !== tBefore;
   if (!settings.paused) visClock += dtReal;
   energyDrift = sim.energyDrift();
@@ -3191,6 +3272,7 @@ function tick(now) {
 
   // ---------------- camera + render
   updateCameraFollow();
+  if (contextLost) return;
   const fd = buildFrameData(visClock);
   renderer.render(fd, settings);
   const ov = buildOverlay(fd);
